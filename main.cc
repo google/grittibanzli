@@ -149,8 +149,9 @@ bool Encode(bool format_gzip, const std::vector<uint8_t>& in,
     meta->insert(meta->end(), in.begin() + end, in.end());
   }
 
-  std::vector<uint8_t> deflate(in.begin() + start, in.begin() + end);
-  return Grittibanzli(deflate, data, choices);
+  const uint8_t* deflate = in.data() + start;
+  size_t deflate_size = end - start;
+  return Grittibanzli(deflate, deflate_size, data, choices);
 }
 
 bool Decode(bool format_gzip, const std::vector<uint8_t>& data,
@@ -161,7 +162,8 @@ bool Decode(bool format_gzip, const std::vector<uint8_t>& data,
     out->assign(meta.begin(), meta.end() - 8);
   }
 
-  if (!Ungrittibanzli(data, choices, out)) return false;
+  if (!Ungrittibanzli(data.data(), data.size(),
+      choices.data(), choices.size(), out)) return false;
 
   if (format_gzip) {
     out->insert(out->end(), meta.end() - 8, meta.end());

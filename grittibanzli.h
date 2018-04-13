@@ -16,6 +16,7 @@
 #define GRITTIBANZLI_H_
 
 #include <stdint.h>
+#include <string.h>
 
 #include <vector>
 
@@ -28,14 +29,14 @@ namespace grittibanzli {
 // After use, compress both the encoded choices and the original data with a
 // stronger compressor to achieve total filesize smaller than the original
 // deflate file.
-bool Grittibanzli(const std::vector<uint8_t>& deflated,
+bool Grittibanzli(const uint8_t* deflated, size_t deflated_size,
                   std::vector<uint8_t>* uncompressed,
                   std::vector<uint8_t>* choices_encoded);
 
 // Reconstructs the deflate stream from the uncompressed data and encoded
 // choices. Appends to deflated if not empty.
-bool Ungrittibanzli(const std::vector<uint8_t>& uncompressed,
-                    const std::vector<uint8_t>& choices_encoded,
+bool Ungrittibanzli(const uint8_t* uncompressed, size_t uncompressed_size,
+                    const uint8_t* choices_encoded, size_t choices_size,
                     std::vector<uint8_t>* deflated);
 
 }  // namespace grittibanzli

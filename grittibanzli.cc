@@ -14,15 +14,29 @@
 
 #include "grittibanzli.h"
 
-#include <assert.h>
 #include <limits.h>
 
+#ifdef GRITTIBANZLI_PRINT_DEBUG
 #include <iostream>
+#endif  // GRITTIBANZLI_PRINT_DEBUG
 #include <algorithm>
 
 namespace grittibanzli {
 
 namespace {
+
+#define UNUSED(x) (void)(x)
+
+bool PrintError(int line) {
+#ifdef GRITTIBANZLI_PRINT_DEBUG
+  std::cout << "error on line: " << line << std::endl;
+#else  // GRITTIBANZLI_PRINT_DEBUG
+  UNUSED(line);
+#endif  // GRITTIBANZLI_PRINT_DEBUG
+  return false;
+}
+
+#define FAILURE PrintError(__LINE__)
 
 // returns index of last element that is <= value, or 0 if none
 int BinarySearch(int value, const std::vector<int>& values) {
@@ -33,34 +47,36 @@ int BinarySearch(int value, const std::vector<int>& values) {
   return result;
 }
 
-int PeekBit(const std::vector<uint8_t>& data, size_t bitpos) {
+int PeekBit(const uint8_t* data, size_t size, size_t bitpos) {
+  UNUSED(size);
   return (data[bitpos >> 3] >> (bitpos & 7)) & 1;
 }
 
-int ReadBit(const std::vector<uint8_t>& data, size_t* bitpos) {
-  int result = PeekBit(data, *bitpos);
+int ReadBit(const uint8_t* data, size_t size, size_t* bitpos) {
+  int result = PeekBit(data, size, *bitpos);
   (*bitpos)++;
   return result;
 }
 
-int ReadBits(int num, const std::vector<uint8_t>& data, size_t* bitpos) {
+int ReadBits(int num, const uint8_t* data, size_t size, size_t* bitpos) {
   int result = 0;
   for (int i = 0; i < num; i++) {
-    result |= ReadBit(data, bitpos) << i;
+    result |= ReadBit(data, size, bitpos) << i;
   }
   return result;
 }
 
-int ReadBitsInv(int num, const std::vector<uint8_t>& data, size_t* bitpos) {
+int ReadBitsInv(int num, const uint8_t* data, size_t size, size_t* bitpos) {
   int result = 0;
   for (int i = 0; i < num; i++) {
-    result = (result << 1) | ReadBit(data, bitpos);
+    result = (result << 1) | ReadBit(data, size, bitpos);
   }
   return result;
 }
 
-int PeekBitsInv(int num, const std::vector<uint8_t>& data, size_t bitpos) {
-  return ReadBitsInv(num, data, &bitpos);
+int PeekBitsInvSafe(int num, const uint8_t* data, size_t size, size_t bitpos) {
+  int safe_num = std::min<int>(num, (size << 3) - bitpos);
+  return ReadBitsInv(safe_num, data, size, &bitpos) << (num - safe_num);
 }
 
 void AppendBit(int bit, std::vector<uint8_t>* data, size_t* bitpos) {
@@ -90,12 +106,8 @@ void AppendBitsInv(int bits, int num, std::vector<uint8_t>* data,
 struct BlockChoices {
   int type;
 
-  // uncompressed bytes range of this block
-  int start_byte;
-  int end_byte;
-  // range in all LZ77 length symbols of this block
-  int start_lz77;
-  int end_lz77;
+  // amount of LZ77 references or literals (for type 0, amount of bytes)
+  int blocksize;
 
   std::vector<int> lengths;  // 1 means literal
   std::vector<int> dists;  // 0 means literal
@@ -107,15 +119,20 @@ struct BlockChoices {
   std::vector<int> ht_lengths;  // code length code lengths
   std::vector<int> all_rle;
   std::vector<int> all_extra;
+
+  // Blocks of btype 0 can have unspecified filler bits in the first byte, and
+  // bfinal blocks of btype 1 or 2 can have unspecified filler bits in the last
+  // byte. This are bits between a not-fully used byte and byte-aligned data.
+  // The deflate spec does not require these to be zero but ignores them, so
+  // their values must be remembered by grittibanzli to reproduce them
+  // exactly.
+  int filler_bits;
 };
 
 // choices of a single deflate stream
 struct DeflateChoices {
   // The deflate stream itself, as blocks
   std::vector<BlockChoices> blocks;
-  // Position in uncompressed data, which can be different from 0 when
-  // concatenated from multiple deflate and other sources
-  size_t abs_pos = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -124,17 +141,17 @@ struct DeflateChoices {
 
 // Given huffman code lengths, gives the huffman symbol bits, as in the deflate
 // specification
-std::vector<int> CodeLengthsToSymbols(const std::vector<int>& lengths,
-    int maxbits = 15) {
+bool CodeLengthsToSymbols(const std::vector<int>& lengths, int maxbits,
+    std::vector<int>* symbols) {
   std::vector<int> bl_count(maxbits + 1, 0);
   std::vector<int> next_code(maxbits + 1);
-  std::vector<int> result(lengths.size(), 0);
   int code;
+  symbols->resize(lengths.size(), 0);
 
   // 1) Count the number of codes for each code length. Let bl_count[N] be the
   // number of codes of length N, N >= 1.
   for (size_t i = 0; i < lengths.size(); i++) {
-    assert(lengths[i] <= maxbits);
+    if (lengths[i] > maxbits) return FAILURE;
     bl_count[lengths[i]]++;
   }
   // 2) Find the numerical value of the smallest code for each code length.
@@ -142,6 +159,8 @@ std::vector<int> CodeLengthsToSymbols(const std::vector<int>& lengths,
   bl_count[0] = 0;
   for (int bits = 1; bits <= maxbits; bits++) {
     code = (code + bl_count[bits - 1]) << 1;
+    // Impossible huffman tree
+    if (code + bl_count[bits] >= (1 << bits) + 1) return FAILURE;
     next_code[bits] = code;
   }
   // 3) Assign numerical values to all codes, using consecutive values for all
@@ -149,27 +168,32 @@ std::vector<int> CodeLengthsToSymbols(const std::vector<int>& lengths,
   for (size_t i = 0; i < lengths.size(); i++) {
     int len = lengths[i];
     if (len != 0) {
-      result[i] = next_code[len];
+      (*symbols)[i] = next_code[len];
       next_code[len]++;
     }
   }
 
-  return result;
+  return true;
 }
 
-// Makes huffman table for decoding, based on "root" bits
-std::vector<std::pair<int, int>> DecodableHuffmanTree(
-    const std::vector<int>& lengths, int maxbits = 15, int root_bits = 8) {
-  const std::vector<int> symbols = CodeLengthsToSymbols(lengths, maxbits);
-  int rootnum = (1 << root_bits);
-  int rootmask = rootnum - 1;
-  std::vector<std::pair<int, int>> result(rootnum, {-1, -1});
+static const int kRootBits = 8;
 
-  // Longest symbol length for symbols with size > root_bits
+// Makes huffman table for decoding, based on "root" bits
+bool DecodableHuffmanTree(const std::vector<int>& lengths,
+    int maxbits, std::vector<std::pair<int, int>>* result) {
+  std::vector<int> symbols;
+  if (!CodeLengthsToSymbols(lengths, maxbits, &symbols)) {
+    return FAILURE;
+  }
+  int rootnum = (1 << kRootBits);
+  int rootmask = rootnum - 1;
+  *result = std::vector<std::pair<int, int>>(rootnum, {-1, -1});
+
+  // Longest symbol length for symbols with size > kRootBits
   std::vector<int> maxlengths(rootnum, -1);
   for (size_t i = 0; i < symbols.size(); i++) {
-    if (lengths[i] > root_bits) {
-      int prefix = (symbols[i] >> (lengths[i] - root_bits)) & rootmask;
+    if (lengths[i] > kRootBits) {
+      int prefix = (symbols[i] >> (lengths[i] - kRootBits)) & rootmask;
       maxlengths[prefix] = std::max(maxlengths[prefix], lengths[i]);
     }
   }
@@ -177,70 +201,69 @@ std::vector<std::pair<int, int>> DecodableHuffmanTree(
   for (size_t i = 0; i < symbols.size(); i++) {
     if (lengths[i] == 0) {
       continue;
-    } else if (lengths[i] == root_bits) {
+    } else if (lengths[i] == kRootBits) {
       // Symbol bits exactly matches table bits
-      result[symbols[i]] = {lengths[i], i};
-    } else if (lengths[i] < root_bits) {
+      (*result)[symbols[i]] = {lengths[i], i};
+    } else if (lengths[i] < kRootBits) {
       // Multiple root table entries with the same prefix for this symbol.
-      int shift = (root_bits - lengths[i]);
+      int shift = (kRootBits - lengths[i]);
       int num = 1 << shift;
       for (int j = 0; j < num; j++) {
         int b = (symbols[i] << shift) + j;
-        assert(b <= rootmask);
-        result[b] = {lengths[i], i};
+        if (!(b <= rootmask)) return FAILURE;
+        (*result)[b] = {lengths[i], i};
       }
     } else {
-      // root_bits is now just a prefix.
-      int prefix = (symbols[i] >> (lengths[i] - root_bits)) & rootmask;
+      // kRootBits is now just a prefix.
+      int prefix = (symbols[i] >> (lengths[i] - kRootBits)) & rootmask;
       int maxlen = maxlengths[prefix];
-      int num = 1 << (maxlen - root_bits);
+      int num = 1 << (maxlen - kRootBits);
       int mask = num - 1;
-      int pointer = result[prefix].second;
+      int pointer = (*result)[prefix].second;
       if (pointer == -1) {
-        pointer = result.size() - prefix;
-        result.resize(result.size() + num, {-1, -1});
-        result[prefix] = {maxlen, pointer};
+        pointer = result->size() - prefix;
+        result->resize(result->size() + num, {-1, -1});
+        (*result)[prefix] = {maxlen, pointer};
       }
       int postfix = (symbols[i] << (maxlen - lengths[i])) & mask;
       int index = prefix + pointer + postfix;
       if (lengths[i] == maxlen) {
         // Symbol bits exactly match subtable bits
-        result[index] = {lengths[i], i};
+        (*result)[index] = {lengths[i], i};
       } else {
-        assert(lengths[i] < maxlen);
+        if (!(lengths[i] < maxlen)) return FAILURE;
         int shift = (maxlen - lengths[i]);
         int num2 = 1 << shift;
         for (int j = 0; j < num2; j++) {
-          result[index + j] = {lengths[i], i};
+          (*result)[index + j] = {lengths[i], i};
         }
       }
     }
   }
-  return result;
+  return true;
 }
 
 
 // Decodes a single huffman symbol. Returns -1 on error.
-int HuffmanDecodeSymbol(const std::vector<uint8_t>& compressed,
-    const std::vector<std::pair<int, int>>& tree, size_t* bitpos,
-    int root_bits = 8) {
-  int index = PeekBitsInv(root_bits, compressed, *bitpos);
+int HuffmanDecodeSymbol(const uint8_t* compressed, size_t size,
+    const std::vector<std::pair<int, int>>& tree, size_t* bitpos) {
+  int index = PeekBitsInvSafe(kRootBits, compressed, size, *bitpos);
 
-  if (tree[index].first <= root_bits) {
+  if (tree[index].first <= kRootBits) {
     *bitpos += tree[index].first;
-    if (*bitpos > compressed.size() * 8) return -1;
+    if (*bitpos > size * 8) return -1;
     return tree[index].second;
   }
 
-  *bitpos += root_bits;
-  if (*bitpos > compressed.size() * 8) return -1;
-  int numbits = tree[index].first - root_bits;
+  *bitpos += kRootBits;
+  if (*bitpos > size * 8) return -1;
+  int numbits = tree[index].first - kRootBits;
 
   int index2 = index + tree[index].second +
-      PeekBitsInv(numbits, compressed, *bitpos);
+      PeekBitsInvSafe(numbits, compressed, size, *bitpos);
   // tree[index2].first is length, tree[index2].second is the value.
-  *bitpos += (tree[index2].first - root_bits);
-  if (*bitpos > compressed.size() * 8) return -1;
+  *bitpos += (tree[index2].first - kRootBits);
+  if (*bitpos > size * 8) return -1;
   return tree[index2].second;
 }
 
@@ -283,11 +306,13 @@ void GetSymbol(int length, int distance, int* lengthsymbol, int* lengthextra,
 
 ////////////////////////////////////////////////////////////////////////////////
 
-bool DeflateEncodeHuffmanHeader(
-    const BlockChoices& block, size_t* bitpos, std::vector<uint8_t>* result,
-    std::vector<int>* ll_lengths, std::vector<int>* dist_lengths) {
+bool DeflateEncodeDynamicHuffmanHeader(
+    const BlockChoices& block, size_t* bitpos, std::vector<uint8_t>* result) {
   std::vector<int> ht_lengths = block.ht_lengths;
-  std::vector<int> ht_symbols = CodeLengthsToSymbols(ht_lengths, 7);
+  std::vector<int> ht_symbols;
+  if (!CodeLengthsToSymbols(ht_lengths, 7, &ht_symbols)) {
+    return FAILURE;
+  }
   int hlit = block.hlit;
   int hdist = block.hdist;
   int hclen = block.hclen;
@@ -310,10 +335,24 @@ bool DeflateEncodeHuffmanHeader(
     if (s == 18) AppendBits(all_extra[i], 7, result, bitpos);
   }
 
+  return true;
+}
+
+void MakeFixedCodes(
+    std::vector<int>* ll_lengths, std::vector<int>* dist_lengths) {
+  for (int i = 0; i <= 143; i++) ll_lengths->push_back(8);
+  for (int i = 144; i <= 255; i++) ll_lengths->push_back(9);
+  for (int i = 256; i <= 279; i++) ll_lengths->push_back(7);
+  for (int i = 280; i <= 287; i++) ll_lengths->push_back(8);
+  for (int i = 0; i <= 31; i++) dist_lengths->push_back(5);
+}
+
+void MakeDynamicCodesFromBlock(const BlockChoices& block,
+    std::vector<int>* ll_lengths, std::vector<int>* dist_lengths) {
   std::vector<int> all_lengths;
-  for (size_t i = 0; i < all_rle.size(); i++) {
-    int s = all_rle[i];
-    int e = all_extra[i];
+  for (size_t i = 0; i < block.all_rle.size(); i++) {
+    int s = block.all_rle[i];
+    int e = block.all_extra[i];
     if (s < 16) {
       all_lengths.push_back(s);
     } else {
@@ -330,7 +369,8 @@ bool DeflateEncodeHuffmanHeader(
       }
       for (int i = 0; i < rep; i++) all_lengths.push_back(s);
     }
-    if (all_lengths.size() >= static_cast<size_t>(hlit + 257 + hdist + 1)) {
+    if (all_lengths.size() >=
+        static_cast<size_t>(block.hlit + 257 + block.hdist + 1)) {
       break;
     }
   }
@@ -338,46 +378,34 @@ bool DeflateEncodeHuffmanHeader(
       all_lengths.begin(), all_lengths.begin() + block.hlit + 257);
   dist_lengths->assign(
       all_lengths.begin() + block.hlit + 257, all_lengths.end());
-  return true;
-}
-
-bool DeflateEncodeHuffmanHeader(const BlockChoices& block, size_t* bitpos,
-    std::vector<uint8_t>* result) {
-  std::vector<int> dummy_ll, dummy_dist;
-  return DeflateEncodeHuffmanHeader(block, bitpos, result,
-                                    &dummy_ll, &dummy_dist);
-}
-
-void MakeFixedCodes(
-    std::vector<int>* ll_lengths, std::vector<int>* dist_lengths) {
-  for (int i = 0; i <= 143; i++) ll_lengths->push_back(8);
-  for (int i = 144; i <= 255; i++) ll_lengths->push_back(9);
-  for (int i = 256; i <= 279; i++) ll_lengths->push_back(7);
-  for (int i = 280; i <= 287; i++) ll_lengths->push_back(8);
-  for (int i = 0; i <= 31; i++) dist_lengths->push_back(5);
+  ll_lengths->resize(288, 0);
+  dist_lengths->resize(32, 0);
 }
 
 
 bool DeflateDecodeHuffmanHeader(
-    const std::vector<uint8_t>& data, size_t* bitpos,
+    const uint8_t* data, size_t size, size_t* bitpos,
     BlockChoices* blockchoices, std::vector<int>* ll_lengths,
     std::vector<int>* dist_lengths) {
-  size_t data_bits = data.size() * 8;
-  if (*bitpos + 14 > data_bits) return false;
-  int hlit = ReadBits(5, data, bitpos);
-  int hdist = ReadBits(5, data, bitpos);
-  int hclen = ReadBits(4, data, bitpos);
+  size_t data_bits = size * 8;
+  if (*bitpos + 14 > data_bits) return FAILURE;
+  int hlit = ReadBits(5, data, size, bitpos);
+  int hdist = ReadBits(5, data, size, bitpos);
+  int hclen = ReadBits(4, data, size, bitpos);
   std::vector<int> ht_lengths(19, 0);
 
   for (int i = 0; i < hclen + 4; i++) {
-    if (*bitpos + 3 > data_bits) return false;
-    ht_lengths[kClClOrder[i]] = ReadBits(3, data, bitpos);
+    if (*bitpos + 3 > data_bits) return FAILURE;
+    ht_lengths[kClClOrder[i]] = ReadBits(3, data, size, bitpos);
   }
   std::vector<int> all_lengths;
-  std::vector<std::pair<int, int>> ht_tree = DecodableHuffmanTree(ht_lengths);
+  std::vector<std::pair<int, int>> ht_tree;
+  if (!DecodableHuffmanTree(ht_lengths, 15, &ht_tree)) {
+    return FAILURE;
+  }
   for (;;) {
-    int s = HuffmanDecodeSymbol(data, ht_tree, bitpos);
-    if (s < 0) return false;
+    int s = HuffmanDecodeSymbol(data, size, ht_tree, bitpos);
+    if (s < 0) return FAILURE;
     blockchoices->all_rle.push_back(s);
     blockchoices->all_extra.push_back(0);
     if (s < 16) {
@@ -385,18 +413,18 @@ bool DeflateDecodeHuffmanHeader(
     } else {
       int rep = 0;
       if (s == 16) {
-        if (*bitpos + 2 > data_bits) return false;
-        rep = ReadBits(2, data, bitpos) + 3;
+        if (*bitpos + 2 > data_bits) return FAILURE;
+        rep = ReadBits(2, data, size, bitpos) + 3;
         blockchoices->all_extra.back() = rep - 3;
         s = all_lengths.empty() ? 0 : all_lengths.back();
       } else if (s == 17) {
-        if (*bitpos + 3 > data_bits) return false;
-        rep = ReadBits(3, data, bitpos) + 3;
+        if (*bitpos + 3 > data_bits) return FAILURE;
+        rep = ReadBits(3, data, size, bitpos) + 3;
         blockchoices->all_extra.back() = rep - 3;
         s = 0;
       } else if (s == 18) {
-        if (*bitpos + 7 > data_bits) return false;
-        rep = ReadBits(7, data, bitpos) + 11;
+        if (*bitpos + 7 > data_bits) return FAILURE;
+        rep = ReadBits(7, data, size, bitpos) + 11;
         blockchoices->all_extra.back() = rep - 11;
         s = 0;
       }
@@ -416,44 +444,49 @@ bool DeflateDecodeHuffmanHeader(
   return true;
 }
 
-bool DeflateDecodeHuffmanHeader(const std::vector<uint8_t>& data,
+bool DeflateDecodeHuffmanHeader(const uint8_t* data, size_t size,
     size_t* bitpos, BlockChoices* blockchoices) {
   std::vector<int> dummy_ll, dummy_dist;
-  return DeflateDecodeHuffmanHeader(data, bitpos, blockchoices,
+  return DeflateDecodeHuffmanHeader(data, size, bitpos, blockchoices,
                                     &dummy_ll, &dummy_dist);
 }
 
-bool DeflateDecode(const std::vector<uint8_t>& deflated,
+bool DeflateDecode(const uint8_t* deflated, size_t size,
                    std::vector<uint8_t>* result, DeflateChoices* choices) {
   size_t bitpos = 0;
-  int lz77_counter = 0;
-  size_t origsize = result->size();
+  size_t deflated_bits = size * 8;
 
   bool bfinal = false;
   while (!bfinal) {
-    if (bitpos >= deflated.size() * 8) return false;
-    bfinal = ReadBits(1, deflated, &bitpos);
-    int btype = ReadBits(2, deflated, &bitpos);
+    if (bitpos + 3 > deflated_bits) return FAILURE;
+    bfinal = ReadBits(1, deflated, size, &bitpos);
+    int btype = ReadBits(2, deflated, size, &bitpos);
+    if (btype < 0 || btype > 2) return FAILURE;
 
     choices->blocks.resize(choices->blocks.size() + 1);
     BlockChoices* blockchoices = &choices->blocks.back();
     blockchoices->type = btype;
-    blockchoices->start_byte = result->size() - origsize;
-    blockchoices->start_lz77 = lz77_counter;
+    blockchoices->filler_bits = 0;
 
     if (btype == 0) {
       size_t pos = (bitpos & 7) ? (bitpos >> 3) + 1 : (bitpos >> 3);
-      if (pos + 4 > deflated.size()) return false;
+      if (pos + 4 > size) return FAILURE;
+
+      int bits_in_byte = (bitpos & 7);
+      if (bits_in_byte != 0) {
+        blockchoices->filler_bits = deflated[bitpos >> 3] >> bits_in_byte;
+      }
 
       int len = deflated[pos] + 256 * deflated[pos + 1];
       pos += 2;
       int nlen = deflated[pos] + 256 * deflated[pos + 1];
       pos += 2;
-      if (pos + len > deflated.size()) return false;
-      if (len != 65535 - nlen) return false;
+      if (pos + len > size) return FAILURE;
+      if (len != 65535 - nlen) return FAILURE;
 
       for (int i = 0; i < len; i++) result->push_back(deflated[pos++]);
 
+      blockchoices->blocksize = len;
       bitpos = pos * 8;
     } else {
       // huffman trees
@@ -463,88 +496,128 @@ bool DeflateDecode(const std::vector<uint8_t>& deflated,
       if (btype == 1) {
         MakeFixedCodes(&ll_lengths, &dist_lengths);
       } else {
-        if (!DeflateDecodeHuffmanHeader(
-            deflated, &bitpos, blockchoices, &ll_lengths, &dist_lengths)) {
-          return false;
+        if (!DeflateDecodeHuffmanHeader(deflated, size, &bitpos, blockchoices,
+            &ll_lengths, &dist_lengths)) {
+          return FAILURE;
         }
       }
-      std::vector<std::pair<int, int>> ll_tree =
-          DecodableHuffmanTree(ll_lengths);
-      std::vector<std::pair<int, int>> dist_tree =
-          DecodableHuffmanTree(dist_lengths);
+      std::vector<std::pair<int, int>> ll_tree;
+      std::vector<std::pair<int, int>> dist_tree;
+      if (!DecodableHuffmanTree(ll_lengths, 15, &ll_tree)) {
+        return FAILURE;
+      }
+      if (!DecodableHuffmanTree(dist_lengths, 15, &dist_tree)) {
+        return FAILURE;
+      }
 
       for (;;) {
-        int s = HuffmanDecodeSymbol(deflated, ll_tree, &bitpos);
-        if (s < 0) return false;
+        int s = HuffmanDecodeSymbol(deflated, size, ll_tree, &bitpos);
+        if (s < 0 || s > 285) return FAILURE;
         if (s == 256) {
           break;
         } else if (s > 256) {
-          lz77_counter++;
-          int ll_extra = ReadBits(kLengthExtra[s - 257], deflated, &bitpos);
-          int d = HuffmanDecodeSymbol(deflated, dist_tree, &bitpos);
-          if (d < 0) return false;
-          int dist_extra = ReadBits(kDistanceExtra[d], deflated, &bitpos);
+          if (bitpos + kLengthExtra[s - 257] > deflated_bits) {
+            return FAILURE;
+          }
+          int ll_extra =
+              ReadBits(kLengthExtra[s - 257], deflated, size, &bitpos);
+          int d = HuffmanDecodeSymbol(deflated, size, dist_tree, &bitpos);
+          if (d < 0 || d > 29) return FAILURE;
+          if (bitpos + kDistanceExtra[d] > deflated_bits) {
+            return FAILURE;
+          }
+          int dist_extra = ReadBits(kDistanceExtra[d], deflated, size, &bitpos);
           int length = kLengthBase[s - 257] + ll_extra;
+          if (s == 284 && ll_extra == 31) {
+            // There are two ways to make length 258: with symbol 285, or with
+            // symbol 284 and extra bits set to 31. Assume that using symbol
+            // 284 is invalid according to the deflate spec, so treat as error.
+            // If we would support this, we would need to output one more
+            // choice byte on length 258 to indicate the representation.
+            return FAILURE;
+          }
           int dist = kDistanceBase[d] + dist_extra;
-          if (static_cast<size_t>(dist) > result->size()) return false;
+          if (static_cast<size_t>(dist) > result->size()) {
+            return FAILURE;
+          }
           for (int i = 0; i < length; i++) {
             result->push_back((*result)[result->size() - dist]);
           }
           blockchoices->lengths.push_back(length);
           blockchoices->dists.push_back(dist);
         } else {
-          lz77_counter++;
           result->push_back(s);
           blockchoices->lengths.push_back(1);
           blockchoices->dists.push_back(0);
         }
       }
+      blockchoices->blocksize = blockchoices->lengths.size();
     }
-    blockchoices->end_byte = result->size() - origsize;
-    blockchoices->end_lz77 = lz77_counter;
+    if (bfinal) {
+      int bits_in_byte = (bitpos & 7);
+      if (bits_in_byte != 0) {
+        blockchoices->filler_bits = deflated[bitpos >> 3] >> bits_in_byte;
+      }
+    }
   }
+  // Deflate streams that have garbage bytes after the valid stream are not
+  // supported.
+  if (((bitpos + 7) >> 3) != size) return FAILURE;
   // Larger than 32 bit sizes not yet supported
-  if (result->size() > 0xffffffff) return false;
+  if (result->size() > 0xffffffff) return FAILURE;
   return true;
 }
 
 bool DeflateEncode(const uint8_t* data, size_t size,
     const DeflateChoices& choices, std::vector<uint8_t>* result) {
-  size_t bitpos = 0;
-  size_t pos = 0;
+  size_t bitpos = 0;  // in result
+  size_t pos = 0;  // in uncompressed data
   for (size_t b = 0; b < choices.blocks.size(); b++) {
     const BlockChoices& block = choices.blocks[b];
-    int blocksize = block.end_byte - block.start_byte;
+    const int blocksize = block.blocksize;
     int btype = block.type;
+    int bfinal = (b + 1) == choices.blocks.size();
+    if (btype < 0 || btype > 2) return FAILURE;
 
-    AppendBits(pos + blocksize >= size, 1, result, &bitpos);
+    AppendBits(bfinal, 1, result, &bitpos);
     AppendBits(btype, 2, result, &bitpos);
 
     if (btype == 0) {
-      if (blocksize >= 65536) return false;
+      if (blocksize >= 65536) return FAILURE;
+      if (pos + blocksize > size) return FAILURE;
+
+      int bits_in_byte = (bitpos & 7);
+      if (bits_in_byte != 0) {
+        result->back() |= (block.filler_bits << bits_in_byte);
+      }
+
       result->push_back(blocksize & 255);
       result->push_back((blocksize >> 8) & 255);
       result->push_back((65535 - blocksize) & 255);
       result->push_back(((65535 - blocksize) >> 8) & 255);
-      for (int i = 0; i < blocksize; i++) result->push_back(data[pos + i]);
+      for (int i = 0; i < blocksize; i++) {
+        result->push_back(data[pos + i]);
+      }
       bitpos = result->size() * 8;
+      pos += block.blocksize;
     } else {
       std::vector<int> literals;
       std::vector<int> lengths;
       std::vector<int> distances;
-      size_t pos2 = pos;
       for (size_t i = 0; i < block.lengths.size(); i++) {
         if (block.lengths[i] > 1) {
           lengths.push_back(block.lengths[i]);
           distances.push_back(block.dists[i]);
           literals.push_back(INT_MAX);
         } else {
+          if (pos >= size) return FAILURE;
           lengths.push_back(0);
           distances.push_back(0);
-          literals.push_back(data[pos2]);
+          literals.push_back(data[pos]);
         }
-        pos2 += block.lengths[i];
+        pos += block.lengths[i];
       }
+      if (lengths.size() != (size_t)blocksize) return FAILURE;
 
       // huffman trees
       std::vector<int> ll_lengths, ll_symbols;
@@ -554,36 +627,49 @@ bool DeflateEncode(const uint8_t* data, size_t size,
         MakeFixedCodes(&ll_lengths, &dist_lengths);
       } else {
         // dynamic huffman codes
-        if (!DeflateEncodeHuffmanHeader(block, &bitpos, result,
-                                        &ll_lengths, &dist_lengths)) {
-          return false;
+        if (!DeflateEncodeDynamicHuffmanHeader(block, &bitpos, result)) {
+          return FAILURE;
         }
+        MakeDynamicCodesFromBlock(block, &ll_lengths, &dist_lengths);
       }
-      ll_symbols = CodeLengthsToSymbols(ll_lengths, 15);
-      dist_symbols = CodeLengthsToSymbols(dist_lengths, 15);
+      if (!CodeLengthsToSymbols(ll_lengths, 15, &ll_symbols)) {
+        return FAILURE;
+      }
+      if (!CodeLengthsToSymbols(dist_lengths, 15, &dist_symbols)) {
+        return FAILURE;
+      }
       for (size_t i = 0; i < distances.size(); i++) {
         if (distances[i]) {
           int lengthsymbol, lengthextra, lengthextranum;
           int distsymbol, distextra, distextranum;
           GetSymbol(lengths[i], distances[i], &lengthsymbol, &lengthextra,
                    &lengthextranum, &distsymbol, &distextra, &distextranum);
-          AppendBitsInv(ll_symbols[lengthsymbol + 257],
-                        ll_lengths[lengthsymbol + 257], result, &bitpos);
+          int lengthindex = lengthsymbol + 257;
+          if (ll_lengths[lengthindex] == 0) return FAILURE;
+          AppendBitsInv(ll_symbols[lengthindex],
+                        ll_lengths[lengthindex], result, &bitpos);
           AppendBits(lengthextra, lengthextranum, result, &bitpos);
+          if (dist_lengths[distsymbol] == 0) return FAILURE;
           AppendBitsInv(dist_symbols[distsymbol], dist_lengths[distsymbol],
                         result, &bitpos);
           AppendBits(distextra, distextranum, result, &bitpos);
         } else {
+          if (ll_lengths[literals[i]] == 0) return FAILURE;
           AppendBitsInv(ll_symbols[literals[i]], ll_lengths[literals[i]],
                         result, &bitpos);
         }
       }
       // end symbol
+      if (ll_lengths[256] == 0) return FAILURE;
       AppendBitsInv(ll_symbols[256], ll_lengths[256], result, &bitpos);
-    }
 
-    pos += blocksize;
-    if (pos >= size) break;
+      if (bfinal) {
+        int bits_in_byte = (bitpos & 7);
+        if (bits_in_byte != 0) {
+          result->back() |= (block.filler_bits << bits_in_byte);
+        }
+      }
+    }
   }
 
   return true;
@@ -608,25 +694,25 @@ void Write32Bit(uint32_t value, std::vector<uint8_t>* data) {
   }
 }
 
-bool Read32Bit(const std::vector<uint8_t>& data,
-    size_t* pos, uint32_t* value) {
+bool Read32Bit(const uint8_t* data, size_t size, size_t* pos, uint32_t* value) {
   int num = 0;
   *value = 0;
   for (;;) {
-    if (*pos >= data.size()) return false;
+    if (*pos >= size) return FAILURE;
     uint8_t byte = data[(*pos)++];
-    if (num > 4 || (num == 4 && byte > 15)) return false;  // 32-bit overflow
+    if (num > 4 || (num == 4 && byte > 15)) {
+      return FAILURE;  // 32-bit overflow
+    }
     *value |= (uint32_t)(byte & 127) << (num * 7);
     if (byte < 128) return true;  // success
     num++;
   }
 }
 
-bool Read32Bit(const std::vector<uint8_t>& data,
-    size_t* pos, int* value) {
+bool Read32Bit(const uint8_t* data, size_t size, size_t* pos, int* value) {
   uint32_t value32;
-  Read32Bit(data, pos, &value32);
-  if (value32 > 0x7fffffff) return false;
+  Read32Bit(data, size, pos, &value32);
+  if (value32 > 0x7fffffff) return FAILURE;
   *value = static_cast<int>(value32);
   return true;
 }
@@ -702,7 +788,7 @@ struct HashChain {
   }
 };
 
-uint32_t getHash(const uint8_t* data, size_t size, size_t pos) {
+uint32_t GetHash(const uint8_t* data, size_t size, size_t pos) {
   uint32_t result = 0;
   if (pos + 2 < size) {
     result ^= (uint32_t)(data[pos + 0] << 0u);
@@ -719,7 +805,7 @@ uint32_t getHash(const uint8_t* data, size_t size, size_t pos) {
   return result & kHashBitMask;
 }
 
-uint32_t countZeros(const uint8_t* data, size_t size, size_t pos,
+uint32_t CountZeros(const uint8_t* data, size_t size, size_t pos,
                     uint32_t prevzeros) {
   size_t end = pos + kWindowSize;
   if (end > size) end = size;
@@ -736,9 +822,9 @@ uint32_t countZeros(const uint8_t* data, size_t size, size_t pos,
 }
 
 // wpos = pos & kWindowMask
-void updateHashChain(const uint8_t* data, size_t size, size_t pos,
+void UpdateHashChain(const uint8_t* data, size_t size, size_t pos,
                      HashChain* hash) {
-  uint32_t hashval = getHash(data, size, pos);
+  uint32_t hashval = GetHash(data, size, pos);
   uint32_t wpos = pos & kWindowMask;
 
   hash->undo_val = hash->val[wpos];
@@ -749,7 +835,7 @@ void updateHashChain(const uint8_t* data, size_t size, size_t pos,
   if (hash->head[hashval] != -1) hash->chain[wpos] = hash->head[hashval];
   hash->head[hashval] = wpos;
 
-  uint32_t numzeros = countZeros(data, size, pos, hash->numzeros);
+  uint32_t numzeros = CountZeros(data, size, pos, hash->numzeros);
   hash->undo_zeros = hash->zeros[wpos];
   hash->undo_chainz = hash->chainz[wpos];
   hash->undo_headz = hash->headz[numzeros];
@@ -762,9 +848,9 @@ void updateHashChain(const uint8_t* data, size_t size, size_t pos,
 }
 
 
-void undoUpdateHashChain(const uint8_t* data, size_t size, size_t pos,
+void UndoUpdateHashChain(const uint8_t* data, size_t size, size_t pos,
                          HashChain* hash) {
-  uint32_t hashval = getHash(data, size, pos);
+  uint32_t hashval = GetHash(data, size, pos);
   uint32_t wpos = pos & kWindowMask;
 
   hash->val[wpos] = hash->undo_val;
@@ -788,9 +874,9 @@ struct Predictor {
   }
 
   bool PredictLength(int* pred_len, int* pred_dist, int* longest_possible) {
-    if (byte >= size) return false;
-    updateHashChain(data, size, byte, &chain);
-    updateHashChain(data, size, byte, &chain_longest);
+    if (byte >= size) return FAILURE;
+    UpdateHashChain(data, size, byte, &chain);
+    UpdateHashChain(data, size, byte, &chain_longest);
     int dummy_dist = 0;
 
     if (static_cast<size_t>(lazy_stored) == byte) {
@@ -810,8 +896,8 @@ struct Predictor {
     lazy_prev = false;
     if (*pred_len >= kMinDeflateLength &&
         byte + 1 < size && *pred_len < maxlazymatch) {
-      updateHashChain(data, size, byte + 1, &chain);
-      updateHashChain(data, size, byte + 1, &chain_longest);
+      UpdateHashChain(data, size, byte + 1, &chain);
+      UpdateHashChain(data, size, byte + 1, &chain_longest);
       int maxchainlen = maxchainlength;
       if (*pred_len > good_length) maxchainlen >>= 2;
       FindMatch(data, size, byte + 1, kWindowSize,
@@ -822,8 +908,8 @@ struct Predictor {
                        kMinDeflateLength, kMaxLongestLength,
                        &chain_longest,
                        &dummy_dist, &lazy_longest_possible);
-      undoUpdateHashChain(data, size, byte + 1, &chain);
-      undoUpdateHashChain(data, size, byte + 1, &chain_longest);
+      UndoUpdateHashChain(data, size, byte + 1, &chain);
+      UndoUpdateHashChain(data, size, byte + 1, &chain_longest);
       if (lazy_len > *pred_len) {
         *pred_len = 1;
         *pred_dist = 0;
@@ -839,9 +925,7 @@ struct Predictor {
 
     if (*pred_len < 0 || *pred_len > kMaxDeflateLength || *pred_dist < 0
         || *pred_dist > kWindowSize || static_cast<size_t>(*pred_dist) > byte) {
-      std::cout << "prediction error: " << *pred_len << " " << *pred_dist
-                << " " << byte << std::endl;
-      std::exit(1);
+      return FAILURE;
     }
 
     return true;
@@ -858,11 +942,11 @@ struct Predictor {
   void Update(int actual_len, int /*pred_len*/) {
     if (actual_len <= max_insert_length) {
       for (int i = 1; i < actual_len; i++) {
-        updateHashChain(data, size, byte + i, &chain);
+        UpdateHashChain(data, size, byte + i, &chain);
       }
     }
     for (int i = 1; i < actual_len; i++) {
-      updateHashChain(data, size, byte + i, &chain_longest);
+      UpdateHashChain(data, size, byte + i, &chain_longest);
     }
 
     byte += actual_len;
@@ -872,13 +956,13 @@ struct Predictor {
   void SkipBytes(int num) {
     if (num < kWindowSize) {
       for (int i = 0; i < num; i++) {
-        updateHashChain(data, size, byte + i, &chain);
+        UpdateHashChain(data, size, byte + i, &chain);
       }
       byte += num;
     } else {
       byte = byte + num - kWindowSize;
       for (int i = 0; i < kWindowSize; i++) {
-        updateHashChain(data, size, byte + i, &chain);
+        UpdateHashChain(data, size, byte + i, &chain);
       }
       byte += kWindowSize;
     }
@@ -927,7 +1011,7 @@ struct Predictor {
     size_t pos2 = pos - prev_result_dist;
     uint32_t wpos = pos & kWindowMask;
     uint32_t wpos2 = pos2 & kWindowMask;
-    uint32_t hashval = getHash(data, size, pos);
+    uint32_t hashval = GetHash(data, size, pos);
     uint32_t hashpos = chain->chain[wpos2];
 
     int prev_dist = prev_result_dist;
@@ -984,7 +1068,7 @@ struct Predictor {
       int min_len, int max_len, uint32_t maxchainlength, HashChain* chain,
       int* result_dist, int* result_len) {
     uint32_t wpos = pos & kWindowMask;
-    uint32_t hashval = getHash(data, size, pos);
+    uint32_t hashval = GetHash(data, size, pos);
     uint32_t hashpos = chain->chain[wpos];
 
     int prev_dist = 0;
@@ -1044,7 +1128,7 @@ struct Predictor {
       int max_dist, int min_len, int max_len, HashChain* chain,
       int* result_dist, int* result_len) {
     uint32_t wpos = pos & kWindowMask;
-    uint32_t hashval = getHash(data, size, pos);
+    uint32_t hashval = GetHash(data, size, pos);
     uint32_t hashpos = chain->chain[wpos];
 
     int prev_dist = 0;
@@ -1121,8 +1205,7 @@ struct Predictor {
 
 // The encoded choices as separate stream, each with different entropy
 struct ChoicesEncoded {
-  std::vector<uint8_t> other;
-  std::vector<uint8_t> blockheaders;
+  std::vector<uint8_t> headers;
   std::vector<uint8_t> lencodes;
   std::vector<uint8_t> distcodes;
   std::vector<uint8_t> lenextra;
@@ -1132,10 +1215,8 @@ struct ChoicesEncoded {
 
 std::vector<uint8_t> Combine(const ChoicesEncoded& encoded) {
   std::vector<uint8_t> result;
-  Write32Bit(encoded.other.size(), &result);
-  AppendTo(encoded.other, &result);
-  Write32Bit(encoded.blockheaders.size(), &result);
-  AppendTo(encoded.blockheaders, &result);
+  Write32Bit(encoded.headers.size(), &result);
+  AppendTo(encoded.headers, &result);
   Write32Bit(encoded.lencodes.size(), &result);
   AppendTo(encoded.lencodes, &result);
   Write32Bit(encoded.distcodes.size(), &result);
@@ -1147,46 +1228,41 @@ std::vector<uint8_t> Combine(const ChoicesEncoded& encoded) {
   return result;
 }
 
-bool Split(const std::vector<uint8_t>& data, ChoicesEncoded* result) {
+bool Split(const uint8_t* data, size_t size, ChoicesEncoded* result) {
   size_t pos = 0;
-  uint32_t size;
+  uint32_t subsize;
 
-  if (!Read32Bit(data, &pos, &size)) return false;
-  if (pos + size > data.size()) return false;
-  result->other.assign(data.begin() + pos, data.begin() + pos + size);
-  pos += size;
+  if (!Read32Bit(data, size, &pos, &subsize)) return FAILURE;
+  if (pos + subsize > size) return FAILURE;
+  result->headers.assign(data + pos, data + pos + subsize);
+  pos += subsize;
 
-  if (!Read32Bit(data, &pos, &size)) return false;
-  if (pos + size > data.size()) return false;
-  result->blockheaders.assign(data.begin() + pos, data.begin() + pos + size);
-  pos += size;
+  if (!Read32Bit(data, size, &pos, &subsize)) return FAILURE;
+  if (pos + subsize > size) return FAILURE;
+  result->lencodes.assign(data + pos, data + pos + subsize);
+  pos += subsize;
 
-  if (!Read32Bit(data, &pos, &size)) return false;
-  if (pos + size > data.size()) return false;
-  result->lencodes.assign(data.begin() + pos, data.begin() + pos + size);
-  pos += size;
+  if (!Read32Bit(data, size, &pos, &subsize)) return FAILURE;
+  if (pos + subsize > size) return FAILURE;
+  result->distcodes.assign(data + pos, data + pos + subsize);
+  pos += subsize;
 
-  if (!Read32Bit(data, &pos, &size)) return false;
-  if (pos + size > data.size()) return false;
-  result->distcodes.assign(data.begin() + pos, data.begin() + pos + size);
-  pos += size;
+  if (!Read32Bit(data, size, &pos, &subsize)) return FAILURE;
+  if (pos + subsize > size) return FAILURE;
+  result->lenextra.assign(data + pos, data + pos + subsize);
+  pos += subsize;
 
-  if (!Read32Bit(data, &pos, &size)) return false;
-  if (pos + size > data.size()) return false;
-  result->lenextra.assign(data.begin() + pos, data.begin() + pos + size);
-  pos += size;
-
-  if (!Read32Bit(data, &pos, &size)) return false;
-  if (pos + size > data.size()) return false;
-  result->distextra.assign(data.begin() + pos, data.begin() + pos + size);
-  pos += size;
+  if (!Read32Bit(data, size, &pos, &subsize)) return FAILURE;
+  if (pos + subsize > size) return FAILURE;
+  result->distextra.assign(data + pos, data + pos + subsize);
+  pos += subsize;
 
   return true;
 }
 
 static const int kMaxDistTries = 16;
 
-int GuessZlibLevel(const std::vector<uint8_t>& data,
+int GuessZlibLevel(const uint8_t* data, size_t size,
                    const DeflateChoices& stream) {
   int bestlevel = 1;
   int bestcorrect = 0;
@@ -1195,10 +1271,7 @@ int GuessZlibLevel(const std::vector<uint8_t>& data,
   for (int level = 1; level <= 10; level++) {
     int numcorrect = 0;
     int numdone = 0;
-    size_t datapos = stream.abs_pos;
-    size_t datasize =
-        stream.blocks.back().end_byte - stream.blocks[0].start_byte;
-    Predictor predictor(data.data() + datapos, datasize);
+    Predictor predictor(data, size);
     predictor.SetZlibLevel(level);
     for (size_t i = 0; i < stream.blocks.size(); i++) {
       const BlockChoices& block = stream.blocks[i];
@@ -1228,38 +1301,34 @@ int GuessZlibLevel(const std::vector<uint8_t>& data,
   return bestlevel;
 }
 
-bool EncodeChoices(const std::vector<uint8_t>& data,
+bool EncodeChoices(const uint8_t* data, size_t size,
                    const DeflateChoices& choices,
                    ChoicesEncoded* encoded) {
-  int level = GuessZlibLevel(data, choices);
-  if (level == 0) return false;
-  encoded->other.push_back(level);
-  Write32Bit(choices.blocks.size(), &encoded->other);
+  int level = GuessZlibLevel(data, size, choices);
+  if (level == 0) return FAILURE;
+  encoded->headers.push_back(level);
+  Write32Bit(choices.blocks.size(), &encoded->headers);
   if (choices.blocks.empty()) return true;
-  size_t datapos = choices.abs_pos;
-  size_t datasize =
-      choices.blocks.back().end_byte - choices.blocks[0].start_byte;
-  Predictor predictor(data.data() + datapos, datasize);
+  Predictor predictor(data, size);
   predictor.SetZlibLevel(level);
-  Write32Bit(datapos, &encoded->other);
-  Write32Bit(datasize, &encoded->other);
   for (size_t i = 0; i < choices.blocks.size(); i++) {
+    bool bfinal = (i + 1) == choices.blocks.size();
     const BlockChoices& block = choices.blocks[i];
 
-    encoded->blockheaders.push_back(block.type);
-    Write32Bit(block.start_byte, &encoded->blockheaders);
-    Write32Bit(block.end_byte, &encoded->blockheaders);
-    Write32Bit(block.start_lz77, &encoded->blockheaders);
-    Write32Bit(block.end_lz77, &encoded->blockheaders);
-    size_t bitpos = encoded->blockheaders.size() * 8;
+    encoded->headers.push_back(block.type);
+    Write32Bit(block.blocksize, &encoded->headers);
+    if (bfinal || block.type == 0) {
+      encoded->headers.push_back(block.filler_bits);
+    }
+    size_t bitpos = encoded->headers.size() * 8;
     if (block.type == 2) {
-      if (!DeflateEncodeHuffmanHeader(
-          block, &bitpos, &encoded->blockheaders)) {
-        return false;
+      if (!DeflateEncodeDynamicHuffmanHeader(
+          block, &bitpos, &encoded->headers)) {
+        return FAILURE;
       }
     }
     if (block.type == 0) {
-      predictor.SkipBytes(block.end_byte - block.start_byte);
+      predictor.SkipBytes(block.blocksize);
       continue;
     }
     for (size_t j = 0; j < block.lengths.size(); j++) {
@@ -1269,7 +1338,7 @@ bool EncodeChoices(const std::vector<uint8_t>& data,
       int pred_len, pred_dist, longest_possible;
       if (!predictor.PredictLength(
           &pred_len, &pred_dist, &longest_possible)) {
-        return false;
+        return FAILURE;
       }
       int encoded_len = 0;
 
@@ -1328,76 +1397,71 @@ bool EncodeChoices(const std::vector<uint8_t>& data,
   return true;
 }
 
-bool DecodeChoices(const std::vector<uint8_t>& data,
+bool DecodeChoices(const uint8_t* data, size_t size,
                    const ChoicesEncoded& encoded,
                    DeflateChoices* result) {
-  size_t opos = 0;
   size_t headerpos = 0;
   size_t lenpos = 0;
   size_t distpos = 0;
   size_t lenextrapos = 0;
   size_t distextrapos = 0;
 
-  if (opos >= encoded.other.size()) return false;
-  int level = encoded.other[opos++];
-  if (level < 1 || level > 10) return false;
+  if (headerpos >= encoded.headers.size()) return FAILURE;
+  int level = encoded.headers[headerpos++];
+  if (level < 1 || level > 10) return FAILURE;
   uint32_t numblocks;
-  if (!Read32Bit(encoded.other, &opos, &numblocks)) return false;
+  if (!Read32Bit(encoded.headers.data(), encoded.headers.size(),
+      &headerpos, &numblocks)) {
+    return FAILURE;
+  }
   if (numblocks == 0) return true;
-  uint32_t datapos;
-  if (!Read32Bit(encoded.other, &opos, &datapos)) return false;
-  result->abs_pos = datapos;
-  uint32_t datasize;
-  if (!Read32Bit(encoded.other, &opos, &datasize)) return false;
-  Predictor predictor(data.data() + datapos, datasize);
+  Predictor predictor(data, size);
   predictor.SetZlibLevel(level);
 
   for (uint32_t ib = 0; ib < numblocks; ib++) {
+    bool bfinal = (ib + 1) == numblocks;
     result->blocks.resize(result->blocks.size() + 1);
     BlockChoices* block = &result->blocks.back();
-    if (headerpos >= encoded.blockheaders.size()) return false;
-    block->type = encoded.blockheaders[headerpos++];
-    if (!Read32Bit(encoded.blockheaders, &headerpos, &block->start_byte)) {
-      return false;
+    if (headerpos >= encoded.headers.size()) return FAILURE;
+    block->type = encoded.headers[headerpos++];
+    if (!Read32Bit(encoded.headers.data(), encoded.headers.size(),
+        &headerpos, &block->blocksize)) {
+      return FAILURE;
     }
-    if (!Read32Bit(encoded.blockheaders, &headerpos, &block->end_byte)) {
-      return false;
+    if (headerpos >= encoded.headers.size()) return FAILURE;
+    if (bfinal || block->type == 0) {
+      block->filler_bits = encoded.headers[headerpos++];
     }
-    if (!Read32Bit(encoded.blockheaders, &headerpos, &block->start_lz77)) {
-      return false;
-    }
-    if (!Read32Bit(encoded.blockheaders, &headerpos, &block->end_lz77)) {
-      return false;
-    }
+
     size_t bitpos = headerpos * 8;
     if (block->type == 2) {
-      if (!DeflateDecodeHuffmanHeader(encoded.blockheaders, &bitpos, block)) {
-        return false;
+      if (!DeflateDecodeHuffmanHeader(encoded.headers.data(),
+          encoded.headers.size(), &bitpos, block)) {
+        return FAILURE;
       }
     }
     headerpos = (bitpos + 7) / 8;
     if (block->type == 0) {
-      predictor.SkipBytes(block->end_byte - block->start_byte);
+      predictor.SkipBytes(block->blocksize);
       continue;
     }
 
-    size_t lz77size = block->end_lz77 - block->start_lz77;
-    for (size_t ie = 0; ie < lz77size; ie++) {
+    for (int ie = 0; ie < block->blocksize; ie++) {
       int pred_len, pred_dist, longest_possible;
       if (!predictor.PredictLength(
           &pred_len, &pred_dist, &longest_possible)) {
-        return false;
+        return FAILURE;
       }
 
       int actual_len = 1;
       int encoded_len = 1;
       if (longest_possible >= kMinDeflateLength) {
-        if (lenpos >= encoded.lencodes.size()) return false;
+        if (lenpos >= encoded.lencodes.size()) return FAILURE;
 
         encoded_len = encoded.lencodes[lenpos++];
 
         if (encoded_len == 255) {
-          if (lenextrapos >= encoded.lenextra.size()) return false;
+          if (lenextrapos >= encoded.lenextra.size()) return FAILURE;
           actual_len = (encoded.lenextra[lenextrapos++] + kMinDeflateLength);
         } else if (encoded_len == 0) {
           actual_len = pred_len;
@@ -1410,32 +1474,26 @@ bool DecodeChoices(const std::vector<uint8_t>& data,
         }
 
         if (actual_len < 0 || actual_len > kMaxDeflateLength) {
-          std::cout << "error: invalid length: " << actual_len << " "
-                    << pred_len << " " << encoded_len << " "
-                    << longest_possible << " " << predictor.byte
-                    << std::endl;
-          return false;
+          return FAILURE;
         }
       }
 
       int actual_dist = 0;
       if (actual_len > 1) {
-        if (distpos >= encoded.distcodes.size()) return false;
+        if (distpos >= encoded.distcodes.size()) return FAILURE;
         int encoded_dist = encoded.distcodes[distpos++];
 
         if (encoded_dist < 0 || encoded_dist > 255) {
-          std::cout << "error: invalid dist: " << encoded_dist << " "
-                    << pred_dist << " " << actual_len << " " << pred_len
-                    << " " << encoded_len << " " << predictor.byte
-                    << std::endl;
-          return false;
+          return FAILURE;
         }
         if (pred_len != actual_len) {
           predictor.PredictDist(actual_len, &pred_dist, 0);
         }
 
         if (encoded_dist == kMaxDistTries) {
-          if (distextrapos + 2 > encoded.distextra.size()) return false;
+          if (distextrapos + 2 > encoded.distextra.size()) {
+            return FAILURE;
+          }
           actual_dist = encoded.distextra[distextrapos] +
               (encoded.distextra[distextrapos + 1] << 8) + 1;
           distextrapos += 2;
@@ -1446,6 +1504,10 @@ bool DecodeChoices(const std::vector<uint8_t>& data,
           actual_dist = pred_dist;
         }
       }
+
+      if (actual_len == 0) return FAILURE;
+      if (actual_len == 1 && actual_dist != 0) return FAILURE;
+      if (actual_len > 1 && actual_dist == 0) return FAILURE;
 
       predictor.Update(actual_len, pred_len);
 
@@ -1458,65 +1520,69 @@ bool DecodeChoices(const std::vector<uint8_t>& data,
 }
 
 bool EncodeChoices(const DeflateChoices& choices,
-                   const std::vector<uint8_t>& data,
+                   const uint8_t* data, size_t size,
                    std::vector<uint8_t>* result) {
   ChoicesEncoded encoded;
-  if (!EncodeChoices(data, choices, &encoded)) return false;
+  if (!EncodeChoices(data, size, choices, &encoded)) return FAILURE;
   *result = Combine(encoded);
   return true;
 }
 
-bool DecodeChoices(const std::vector<uint8_t>& data,
-                   const std::vector<uint8_t>& encoded,
+bool DecodeChoices(const uint8_t* data, size_t size,
+                   const uint8_t* encoded, size_t encoded_size,
                    DeflateChoices* result) {
-  if (encoded.empty()) return false;
+  if (encoded_size == 0) return FAILURE;
   ChoicesEncoded choices_encoded;
-  if (!Split(encoded, &choices_encoded)) return false;
-  return DecodeChoices(data, choices_encoded, result);
+  if (!Split(encoded, encoded_size, &choices_encoded)) return FAILURE;
+  return DecodeChoices(data, size, choices_encoded, result);
 }
 
 }  // namespace
 
-bool Grittibanzli(const std::vector<uint8_t>& deflated,
+bool Grittibanzli(const uint8_t* deflated, size_t size,
                   std::vector<uint8_t>* uncompressed,
                   std::vector<uint8_t>* choices_encoded) {
-  if (deflated.size() > 0xffffffff) {
+  if (size > 0xffffffff) {
     // Larger than 32 bit sizes not yet supported
-    return false;
+    return FAILURE;
   }
 
   DeflateChoices choices;
   // deflate *de*code is for *en*coding for us
-  if (!DeflateDecode(deflated, uncompressed, &choices)) {
-    return false;
+  if (!DeflateDecode(deflated, size, uncompressed, &choices)) {
+    return FAILURE;
   }
 
   // quick verify (not full verification)
   std::vector<uint8_t> test;
   if (!DeflateEncode(uncompressed->data(), uncompressed->size(), choices, &test)
-      || test != deflated) {
-    std::cout << "internal verification failed" << std::endl;
-    return false;
+      || test.size() != size || memcmp(test.data(), deflated, size) != 0) {
+#ifdef GRITTIBANZLI_CRASH_ON_INTERNAL_ERROR
+    std::exit(1);  // for fuzzing, to detect deflate roundtrip mismatch
+#endif  // GRITTIBANZLI_CRASH_ON_INTERNAL_ERROR
+    return FAILURE;
   }
 
-  if (!EncodeChoices(choices, *uncompressed, choices_encoded)) {
-    return false;
+  if (!EncodeChoices(choices, uncompressed->data(), uncompressed->size(),
+      choices_encoded)) {
+    return FAILURE;
   }
 
   return true;
 }
 
-bool Ungrittibanzli(const std::vector<uint8_t>& uncompressed,
-                    const std::vector<uint8_t>& choices_encoded,
+bool Ungrittibanzli(const uint8_t* uncompressed, size_t size,
+                    const uint8_t* choices_encoded, size_t choices_size,
                     std::vector<uint8_t>* deflated) {
   DeflateChoices choices;
-  if (!DecodeChoices(uncompressed, choices_encoded, &choices)) {
-    return false;
+  if (!DecodeChoices(uncompressed, size,
+      choices_encoded, choices_size, &choices)) {
+    return FAILURE;
   }
   // deflate *en*code is for *de*coding for us
-  if (!DeflateEncode(uncompressed.data(), uncompressed.size(),
+  if (!DeflateEncode(uncompressed, size,
       choices, deflated)) {
-    return false;
+    return FAILURE;
   }
 
   return true;
